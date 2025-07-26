@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: utah-golf-api
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        fromService:
+          type: web
+          name: utah-golf-api
+          property: port
+    autoDeploy: true
