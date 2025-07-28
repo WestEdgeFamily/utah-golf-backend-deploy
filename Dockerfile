@@ -35,6 +35,9 @@ WORKDIR /usr/src/app
 # Copy package files
 COPY package*.json ./
 
+# Skip Puppeteer Chrome download since we're installing it separately
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
 # Install dependencies
 RUN npm ci --omit=dev
 
