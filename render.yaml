@@ -1,9 +1,8 @@
 services:
   - type: web
     name: utah-golf-api
-    env: node
-    buildCommand: npm install
-    startCommand: npm start
+    env: docker
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: NODE_ENV
         value: production
@@ -12,4 +11,8 @@ services:
           type: web
           name: utah-golf-api
           property: port
+      - key: PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
+        value: true
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/google-chrome-stable
     autoDeploy: true

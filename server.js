@@ -34,7 +34,7 @@ let browser;
 // Initialize browser
 async function initBrowser() {
   try {
-    browser = await puppeteer.launch({
+    const puppeteerOptions = {
       headless: true,
       args: [
         '--no-sandbox',
@@ -46,7 +46,14 @@ async function initBrowser() {
         '--single-process',
         '--disable-gpu'
       ]
-    });
+    };
+
+    // Use custom Chrome path if provided
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      puppeteerOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+
+    browser = await puppeteer.launch(puppeteerOptions);
     console.log('Browser initialized');
   } catch (error) {
     console.error('Error initializing browser:', error);
