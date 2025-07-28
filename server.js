@@ -7,13 +7,13 @@ const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
 const axios = require('axios');
 const cron = require('node-cron');
-const Redis = require('redis');
+// const Redis = require('redis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Redis client for caching
-const redis = Redis.createClient(process.env.REDIS_URL || 'redis://localhost:6379');
+// Simple in-memory cache (replace with Redis in production)
+const cache = new Map();
 
 // Middleware
 app.use(helmet());
@@ -122,9 +122,9 @@ class GolfNowScraper {
     
     try {
       // Check cache first
-      const cachedData = await redis.get(cacheKey);
-      if (cachedData) {
-        return JSON.parse(cachedData);
+      const cachedData = cache.get(cacheKey);
+      if (cachedData && cachedData.expires > Date.now()) {
+        return cachedData.data;
       }
 
       const page = await browser.newPage();
@@ -162,7 +162,10 @@ class GolfNowScraper {
       await page.close();
 
       // Cache for 15 minutes
-      await redis.setex(cacheKey, 900, JSON.stringify(teeTimes));
+      cache.set(cacheKey, {
+        data: teeTimes,
+        expires: Date.now() + 15 * 60 * 1000
+      });
       
       return teeTimes;
     } catch (error) {
@@ -177,9 +180,9 @@ class ForeUpScraper {
     const cacheKey = `foreup:${course.id}:${date}`;
     
     try {
-      const cachedData = await redis.get(cacheKey);
-      if (cachedData) {
-        return JSON.parse(cachedData);
+      const cachedData = cache.get(cacheKey);
+      if (cachedData && cachedData.expires > Date.now()) {
+        return cachedData.data;
       }
 
       // Extract booking and schedule IDs from URL
@@ -217,7 +220,10 @@ class ForeUpScraper {
         isHotDeal: slot.special === true || slot.is_special === true,
       })).filter(time => time.time);
 
-      await redis.setex(cacheKey, 900, JSON.stringify(teeTimes));
+      cache.set(cacheKey, {
+        data: teeTimes,
+        expires: Date.now() + 15 * 60 * 1000
+      });
       return teeTimes;
     } catch (error) {
       console.error(`ForeUp scraper error for ${course.name}:`, error);
@@ -231,9 +237,9 @@ class ChronogolfScraper {
     const cacheKey = `chronogolf:${course.id}:${date}`;
     
     try {
-      const cachedData = await redis.get(cacheKey);
-      if (cachedData) {
-        return JSON.parse(cachedData);
+      const cachedData = cache.get(cacheKey);
+      if (cachedData && cachedData.expires > Date.now()) {
+        return cachedData.data;
       }
 
       const courseSlug = course.bookingUrl.match(/course\/([^/?]+)/)?.[1];
@@ -262,7 +268,10 @@ class ChronogolfScraper {
         isHotDeal: slot.is_deal || slot.special_rate || false,
       })).filter(time => time.time);
 
-      await redis.setex(cacheKey, 900, JSON.stringify(teeTimes));
+      cache.set(cacheKey, {
+        data: teeTimes,
+        expires: Date.now() + 15 * 60 * 1000
+      });
       return teeTimes;
     } catch (error) {
       console.error(`Chronogolf scraper error for ${course.name}:`, error);
@@ -480,8 +489,8 @@ app.use((req, res) => {
 // Start server
 async function startServer() {
   try {
-    await redis.connect();
-    console.log('Connected to Redis');
+    // Using in-memory cache
+    console.log('Cache initialized');
     
     await initBrowser();
     
@@ -502,7 +511,7 @@ process.on('SIGTERM', async () => {
     await browser.close();
   }
   
-  await redis.disconnect();
+  // Cache cleanup not needed for in-memory
   process.exit(0);
 });
 

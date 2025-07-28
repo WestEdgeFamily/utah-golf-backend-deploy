@@ -1,16 +1,12 @@
 services:
   - type: web
     name: utah-golf-api
-    env: docker
-    dockerfilePath: ./Dockerfile
+    runtime: node
+    buildCommand: "./render-build.sh"
+    startCommand: "node server.js"
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        fromService:
-          type: web
-          name: utah-golf-api
-          property: port
       - key: PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
         value: true
       - key: PUPPETEER_EXECUTABLE_PATH
