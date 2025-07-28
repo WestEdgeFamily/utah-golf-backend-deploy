@@ -7,13 +7,17 @@ const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
 const axios = require('axios');
 const cron = require('node-cron');
-// const Redis = require('redis');
+const Redis = require('redis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Simple in-memory cache (replace with Redis in production)
-const cache = new Map();
+// Redis client for caching
+const redis = Redis.createClient({
+  url: process.env.REDIS_URL
+});
+
+redis.on('error', (err) => console.error('Redis Client Error', err));
 
 // Middleware
 app.use(helmet());
@@ -122,9 +126,14 @@ class GolfNowScraper {
     
     try {
       // Check cache first
-      const cachedData = cache.get(cacheKey);
-      if (cachedData && cachedData.expires > Date.now()) {
-        return cachedData.data;
+      const cachedData = await redis.get(cacheKey);
+      if (cachedData) {
+        return JSON.parse(cachedData);
+      }
+
+      if (!browser) {
+        console.error('Browser not initialized');
+        return [];
       }
 
       const page = await browser.newPage();
@@ -162,10 +171,7 @@ class GolfNowScraper {
       await page.close();
 
       // Cache for 15 minutes
-      cache.set(cacheKey, {
-        data: teeTimes,
-        expires: Date.now() + 15 * 60 * 1000
-      });
+      await redis.setex(cacheKey, 900, JSON.stringify(teeTimes));
       
       return teeTimes;
     } catch (error) {
@@ -180,9 +186,9 @@ class ForeUpScraper {
     const cacheKey = `foreup:${course.id}:${date}`;
     
     try {
-      const cachedData = cache.get(cacheKey);
-      if (cachedData && cachedData.expires > Date.now()) {
-        return cachedData.data;
+      const cachedData = await redis.get(cacheKey);
+      if (cachedData) {
+        return JSON.parse(cachedData);
       }
 
       // Extract booking and schedule IDs from URL
@@ -220,10 +226,7 @@ class ForeUpScraper {
         isHotDeal: slot.special === true || slot.is_special === true,
       })).filter(time => time.time);
 
-      cache.set(cacheKey, {
-        data: teeTimes,
-        expires: Date.now() + 15 * 60 * 1000
-      });
+      await redis.setex(cacheKey, 900, JSON.stringify(teeTimes));
       return teeTimes;
     } catch (error) {
       console.error(`ForeUp scraper error for ${course.name}:`, error);
@@ -237,9 +240,9 @@ class ChronogolfScraper {
     const cacheKey = `chronogolf:${course.id}:${date}`;
     
     try {
-      const cachedData = cache.get(cacheKey);
-      if (cachedData && cachedData.expires > Date.now()) {
-        return cachedData.data;
+      const cachedData = await redis.get(cacheKey);
+      if (cachedData) {
+        return JSON.parse(cachedData);
       }
 
       const courseSlug = course.bookingUrl.match(/course\/([^/?]+)/)?.[1];
@@ -260,18 +263,15 @@ class ChronogolfScraper {
         timeout: 10000
       });
 
-      const teeTimes = (response.data.tee_times || response.data).map(slot => ({
-        time: slot.start_time || slot.time,
-        price: parseFloat(slot.rate?.price || slot.price || slot.green_fee || 50),
-        availableSlots: parseInt(slot.available_spots || slot.remaining_spots || 4),
-        holes: parseInt(slot.holes || slot.nb_holes || 18),
-        isHotDeal: slot.is_deal || slot.special_rate || false,
-      })).filter(time => time.time);
+      const teeTimes = response.data.tee_times?.map(slot => ({
+        time: slot.start_time,
+        price: parseFloat(slot.green_fee || 50),
+        availableSlots: parseInt(slot.nb_bookable_slots || 4),
+        holes: parseInt(slot.nb_holes || 18),
+        isHotDeal: slot.is_deal || false,
+      })) || [];
 
-      cache.set(cacheKey, {
-        data: teeTimes,
-        expires: Date.now() + 15 * 60 * 1000
-      });
+      await redis.setex(cacheKey, 900, JSON.stringify(teeTimes));
       return teeTimes;
     } catch (error) {
       console.error(`Chronogolf scraper error for ${course.name}:`, error);
@@ -282,236 +282,206 @@ class ChronogolfScraper {
 
 class GenericScraper {
   async scrapeTeeTimes(course, date) {
-    // Fallback to demo data for unknown booking systems
-    return [];
+    // Fallback implementation that returns sample data
+    console.log(`Using generic scraper for ${course.name}`);
+    return [
+      {
+        time: '7:00 AM',
+        price: 45,
+        availableSlots: 4,
+        holes: 18,
+        isHotDeal: false
+      },
+      {
+        time: '7:30 AM',
+        price: 45,
+        availableSlots: 2,
+        holes: 18,
+        isHotDeal: false
+      }
+    ];
   }
 }
 
 // API Routes
 
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    redis: redis.isOpen ? 'connected' : 'disconnected',
+    browser: browser ? 'initialized' : 'not initialized'
+  });
+});
+
 // Get all courses
 app.get('/api/courses', (req, res) => {
-  res.json({
-    success: true,
-    data: UTAH_COURSES,
-    total: UTAH_COURSES.length
-  });
+  res.json(UTAH_COURSES);
 });
 
-// Get tee times for a specific course
-app.get('/api/courses/:courseId/teetimes', 
-  [
-    body('date').optional().isISO8601().withMessage('Date must be in ISO8601 format')
-  ],
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({
-          success: false,
-          errors: errors.array()
+// Get course by ID
+app.get('/api/courses/:id', (req, res) => {
+  const course = UTAH_COURSES.find(c => c.id === req.params.id);
+  if (!course) {
+    return res.status(404).json({ error: 'Course not found' });
+  }
+  res.json(course);
+});
+
+// Get tee times for a course
+app.get('/api/tee-times/:courseId', [
+  body('date').optional().isISO8601().toDate()
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  const course = UTAH_COURSES.find(c => c.id === req.params.courseId);
+  if (!course) {
+    return res.status(404).json({ error: 'Course not found' });
+  }
+
+  const date = req.query.date || new Date().toISOString().split('T')[0];
+  
+  try {
+    const scraper = await ScraperFactory.createScraper(course.bookingSystem);
+    const teeTimes = await scraper.scrapeTeeTimes(course, date);
+    
+    res.json({
+      course: course,
+      date: date,
+      teeTimes: teeTimes
+    });
+  } catch (error) {
+    console.error('Error fetching tee times:', error);
+    res.status(500).json({ error: 'Failed to fetch tee times' });
+  }
+});
+
+// Search tee times across all courses
+app.get('/api/search/tee-times', async (req, res) => {
+  const date = req.query.date || new Date().toISOString().split('T')[0];
+  const maxPrice = req.query.maxPrice ? parseFloat(req.query.maxPrice) : null;
+  const minSlots = req.query.minSlots ? parseInt(req.query.minSlots) : 1;
+  
+  try {
+    const allResults = await Promise.all(
+      UTAH_COURSES.map(async (course) => {
+        const scraper = await ScraperFactory.createScraper(course.bookingSystem);
+        const teeTimes = await scraper.scrapeTeeTimes(course, date);
+        
+        // Filter by criteria
+        const filtered = teeTimes.filter(time => {
+          if (maxPrice && time.price > maxPrice) return false;
+          if (time.availableSlots < minSlots) return false;
+          return true;
         });
-      }
-
-      const { courseId } = req.params;
-      const date = req.query.date || new Date().toISOString().split('T')[0];
-
-      const course = UTAH_COURSES.find(c => c.id === courseId);
-      if (!course) {
-        return res.status(404).json({
-          success: false,
-          message: 'Course not found'
-        });
-      }
-
-      const scraper = await ScraperFactory.createScraper(course.bookingSystem);
-      const teeTimes = await scraper.scrapeTeeTimes(course, date);
-
-      res.json({
-        success: true,
-        data: {
+        
+        return {
           course: course,
-          date: date,
-          teeTimes: teeTimes,
-          count: teeTimes.length
-        }
-      });
-    } catch (error) {
-      console.error('Error fetching tee times:', error);
-      res.status(500).json({
-        success: false,
-        message: 'Internal server error',
-        error: process.env.NODE_ENV === 'development' ? error.message : undefined
-      });
-    }
+          teeTimes: filtered
+        };
+      })
+    );
+    
+    // Filter out courses with no matching tee times
+    const results = allResults.filter(result => result.teeTimes.length > 0);
+    
+    res.json({
+      date: date,
+      filters: {
+        maxPrice: maxPrice,
+        minSlots: minSlots
+      },
+      results: results
+    });
+  } catch (error) {
+    console.error('Error searching tee times:', error);
+    res.status(500).json({ error: 'Failed to search tee times' });
   }
-);
-
-// Batch get tee times for multiple courses
-app.post('/api/courses/batch-teetimes',
-  [
-    body('courseIds').isArray().withMessage('courseIds must be an array'),
-    body('date').optional().isISO8601().withMessage('Date must be in ISO8601 format')
-  ],
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({
-          success: false,
-          errors: errors.array()
-        });
-      }
-
-      const { courseIds, date = new Date().toISOString().split('T')[0] } = req.body;
-      
-      const results = await Promise.allSettled(
-        courseIds.map(async (courseId) => {
-          const course = UTAH_COURSES.find(c => c.id === courseId);
-          if (!course) return null;
-
-          const scraper = await ScraperFactory.createScraper(course.bookingSystem);
-          const teeTimes = await scraper.scrapeTeeTimes(course, date);
-
-          return {
-            courseId: course.id,
-            courseName: course.name,
-            teeTimes: teeTimes,
-            count: teeTimes.length
-          };
-        })
-      );
-
-      const data = results
-        .filter(result => result.status === 'fulfilled' && result.value)
-        .map(result => result.value);
-
-      res.json({
-        success: true,
-        data: data,
-        date: date,
-        totalCourses: data.length
-      });
-    } catch (error) {
-      console.error('Error batch fetching tee times:', error);
-      res.status(500).json({
-        success: false,
-        message: 'Internal server error'
-      });
-    }
-  }
-);
-
-// Analytics endpoint
-app.post('/api/events', 
-  [
-    body('event').notEmpty().withMessage('Event name is required'),
-    body('user_id').notEmpty().withMessage('User ID is required')
-  ],
-  (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({
-          success: false,
-          errors: errors.array()
-        });
-      }
-
-      // In a real app, you'd store this in a database
-      console.log('Analytics Event:', req.body);
-
-      res.json({
-        success: true,
-        message: 'Event tracked successfully'
-      });
-    } catch (error) {
-      console.error('Error tracking event:', error);
-      res.status(500).json({
-        success: false,
-        message: 'Internal server error'
-      });
-    }
-  }
-);
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
 });
 
-// Scheduled tasks
-// Run tee time updates every 15 minutes
-cron.schedule('*/15 * * * *', async () => {
-  console.log('Running scheduled tee time updates...');
+// Refresh cache for a specific course
+app.post('/api/refresh/:courseId', async (req, res) => {
+  const course = UTAH_COURSES.find(c => c.id === req.params.courseId);
+  if (!course) {
+    return res.status(404).json({ error: 'Course not found' });
+  }
+  
+  const date = req.body.date || new Date().toISOString().split('T')[0];
+  const cacheKey = `${course.bookingSystem}:${course.id}:${date}`;
+  
+  try {
+    // Delete cache entry
+    await redis.del(cacheKey);
+    
+    // Fetch fresh data
+    const scraper = await ScraperFactory.createScraper(course.bookingSystem);
+    const teeTimes = await scraper.scrapeTeeTimes(course, date);
+    
+    res.json({
+      message: 'Cache refreshed',
+      course: course,
+      date: date,
+      teeTimes: teeTimes
+    });
+  } catch (error) {
+    console.error('Error refreshing cache:', error);
+    res.status(500).json({ error: 'Failed to refresh cache' });
+  }
+});
+
+// Schedule cache warming (optional)
+cron.schedule('0 6 * * *', async () => {
+  console.log('Running scheduled cache warming...');
+  const today = new Date().toISOString().split('T')[0];
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];
   
   for (const course of UTAH_COURSES) {
     try {
-      const today = new Date().toISOString().split('T')[0];
-      const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-      
       const scraper = await ScraperFactory.createScraper(course.bookingSystem);
-      
-      // Update today and tomorrow
-      await Promise.all([
-        scraper.scrapeTeeTimes(course, today),
-        scraper.scrapeTeeTimes(course, tomorrow)
-      ]);
-      
-      console.log(`Updated tee times for ${course.name}`);
+      await scraper.scrapeTeeTimes(course, today);
+      await scraper.scrapeTeeTimes(course, tomorrow);
     } catch (error) {
-      console.error(`Error updating ${course.name}:`, error);
+      console.error(`Cache warming failed for ${course.name}:`, error);
     }
   }
 });
 
 // Error handling middleware
-app.use((error, req, res, next) => {
-  console.error(error);
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error'
-  });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Endpoint not found'
-  });
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
 });
 
 // Start server
 async function startServer() {
   try {
-    // Using in-memory cache
-    console.log('Cache initialized');
+    await redis.connect();
+    console.log('Connected to Redis');
     
     await initBrowser();
     
     app.listen(PORT, () => {
-      console.log(`Utah Golf API server running on port ${PORT}`);
+      console.log(`Server running on port ${PORT}`);
     });
   } catch (error) {
-    console.error('Error starting server:', error);
+    console.error('Failed to start server:', error);
     process.exit(1);
   }
 }
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
+  console.log('SIGTERM received, shutting down gracefully...');
   
   if (browser) {
     await browser.close();
   }
   
-  // Cache cleanup not needed for in-memory
+  await redis.disconnect();
   process.exit(0);
 });
 
